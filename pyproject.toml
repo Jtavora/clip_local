@@ -1,0 +1,15 @@
+[project]
+name = "clip-local"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11,<3.12"
+dependencies = [
+    "fastapi>=0.129.0",
+    "huggingface-hub>=1.4.1",
+    "pillow>=12.1.1",
+    "python-multipart>=0.0.22",
+    "torch>=2.10.0",
+    "transformers>=5.2.0",
+    "uvicorn[standard]>=0.41.0",
+]
