@@ -8,55 +8,42 @@ from pydantic import BaseModel, Field
 from PIL import Image
 from transformers import CLIPModel, CLIPProcessor
 
-# =========================
-# Config
-# =========================
 MODEL_ID = os.getenv("CLIP_MODEL_ID", "openai/clip-vit-large-patch14")
 NORMALIZE = os.getenv("EMBEDDING_L2_NORMALIZE", "true").lower() == "true"
 
-app = FastAPI(title="CLIP Embeddings API", version="1.1.1")
+app = FastAPI(title="CLIP Embeddings API", version="1.2.0")
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 use_amp = (device == "cuda") and (os.getenv("USE_AMP_FP16", "true").lower() == "true")
 
 model = CLIPModel.from_pretrained(MODEL_ID).to(device).eval()
 processor = CLIPProcessor.from_pretrained(MODEL_ID)
+
+# Dimensão real do embedding no espaço multimodal
 EMBED_DIM = int(model.config.projection_dim)
 
 
-# =========================
-# Schemas
-# =========================
 class TextEmbeddingsRequest(BaseModel):
     texts: list[str] = Field(..., min_length=1)
 
 
-# =========================
-# Helpers
-# =========================
 def _ensure_tensor(x: Any, *, name: str) -> torch.Tensor:
     if isinstance(x, torch.Tensor):
         return x
     raise TypeError(f"{name} must be a torch.Tensor, got: {type(x)}")
 
 
-def _l2_normalize(x: torch.Tensor) -> torch.Tensor:
-    x = _ensure_tensor(x, name="feats").float()
-    return torch.nn.functional.normalize(x, p=2, dim=-1)
-
-
 def _maybe_normalize(x: torch.Tensor) -> torch.Tensor:
-    x = _ensure_tensor(x, name="feats").float()
-    return _l2_normalize(x) if NORMALIZE else x
+    x = _ensure_tensor(x, name="embeds").float()
+    if not NORMALIZE:
+        return x
+    return torch.nn.functional.normalize(x, p=2, dim=-1)
 
 
 def _to_device(d: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
     return {k: v.to(device) for k, v in d.items()}
 
 
-# =========================
-# Routes
-# =========================
 @app.get("/health")
 def health():
     return {
@@ -72,9 +59,6 @@ def health():
 @app.post("/v1/embeddings/text")
 @torch.inference_mode()
 def embeddings_text(req: TextEmbeddingsRequest):
-    """
-    Retorna embeddings de texto (Tensor) no espaço multimodal do CLIP.
-    """
     if not req.texts:
         raise HTTPException(status_code=400, detail="texts must not be empty")
 
@@ -85,7 +69,7 @@ def embeddings_text(req: TextEmbeddingsRequest):
         truncation=True,
     )
 
-    # Pegue APENAS o que o get_text_features usa
+    # Use o forward do CLIPModel e pegue text_embeds (tensor)
     text_inputs = {
         "input_ids": inputs["input_ids"],
         "attention_mask": inputs["attention_mask"],
@@ -94,9 +78,18 @@ def embeddings_text(req: TextEmbeddingsRequest):
 
     if use_amp:
         with torch.cuda.amp.autocast(dtype=torch.float16):
-            feats = model.get_text_features(**text_inputs)  # Tensor (N, D)
+            out = model(**text_inputs, return_dict=True)
     else:
-        feats = model.get_text_features(**text_inputs)  # Tensor (N, D)
+        out = model(**text_inputs, return_dict=True)
+
+    # Em versões compatíveis do transformers, isso é Tensor: (N, D)
+    feats = getattr(out, "text_embeds", None)
+    if feats is None:
+        # fallback extra caso a lib retorne outro formato
+        raise RuntimeError(
+            "CLIPModel output does not contain text_embeds. "
+            "Check transformers version / model class."
+        )
 
     feats = _maybe_normalize(feats)
 
@@ -115,9 +108,6 @@ def embeddings_text(req: TextEmbeddingsRequest):
 @app.post("/v1/embeddings/image")
 @torch.inference_mode()
 async def embeddings_image(file: UploadFile = File(...)):
-    """
-    Retorna embeddings de imagem (Tensor) no espaço multimodal do CLIP.
-    """
     contents = await file.read()
     if not contents:
         raise HTTPException(status_code=400, detail="empty file")
@@ -129,15 +119,21 @@ async def embeddings_image(file: UploadFile = File(...)):
 
     inputs = processor(images=image, return_tensors="pt")
 
-    # Pegue APENAS o que o get_image_features usa
     image_inputs = {"pixel_values": inputs["pixel_values"]}
     image_inputs = _to_device(image_inputs)
 
     if use_amp:
         with torch.cuda.amp.autocast(dtype=torch.float16):
-            feats = model.get_image_features(**image_inputs)  # Tensor (1, D)
+            out = model(**image_inputs, return_dict=True)
     else:
-        feats = model.get_image_features(**image_inputs)  # Tensor (1, D)
+        out = model(**image_inputs, return_dict=True)
+
+    feats = getattr(out, "image_embeds", None)
+    if feats is None:
+        raise RuntimeError(
+            "CLIPModel output does not contain image_embeds. "
+            "Check transformers version / model class."
+        )
 
     feats = _maybe_normalize(feats)
 
