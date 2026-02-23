@@ -11,15 +11,13 @@ from transformers import CLIPModel, CLIPProcessor
 MODEL_ID = os.getenv("CLIP_MODEL_ID", "openai/clip-vit-large-patch14")
 NORMALIZE = os.getenv("EMBEDDING_L2_NORMALIZE", "true").lower() == "true"
 
-app = FastAPI(title="CLIP Embeddings API", version="1.2.0")
+app = FastAPI(title="CLIP Embeddings API", version="1.2.1")
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 use_amp = (device == "cuda") and (os.getenv("USE_AMP_FP16", "true").lower() == "true")
 
 model = CLIPModel.from_pretrained(MODEL_ID).to(device).eval()
 processor = CLIPProcessor.from_pretrained(MODEL_ID)
-
-# Dimensão real do embedding no espaço multimodal
 EMBED_DIM = int(model.config.projection_dim)
 
 
@@ -69,27 +67,30 @@ def embeddings_text(req: TextEmbeddingsRequest):
         truncation=True,
     )
 
-    # Use o forward do CLIPModel e pegue text_embeds (tensor)
-    text_inputs = {
-        "input_ids": inputs["input_ids"],
-        "attention_mask": inputs["attention_mask"],
-    }
-    text_inputs = _to_device(text_inputs)
+    text_inputs = _to_device(
+        {
+            "input_ids": inputs["input_ids"],
+            "attention_mask": inputs["attention_mask"],
+        }
+    )
 
     if use_amp:
         with torch.cuda.amp.autocast(dtype=torch.float16):
-            out = model(**text_inputs, return_dict=True)
+            text_outputs = model.text_model(**text_inputs)  # BaseModelOutputWithPooling
     else:
-        out = model(**text_inputs, return_dict=True)
+        text_outputs = model.text_model(**text_inputs)
 
-    # Em versões compatíveis do transformers, isso é Tensor: (N, D)
-    feats = getattr(out, "text_embeds", None)
-    if feats is None:
-        # fallback extra caso a lib retorne outro formato
-        raise RuntimeError(
-            "CLIPModel output does not contain text_embeds. "
-            "Check transformers version / model class."
-        )
+    # last_hidden_state: (N, T, H)
+    last_hidden = text_outputs.last_hidden_state
+
+    # Posição do último token válido em cada sequência:
+    # attention_mask soma os 1s (tokens válidos) => último índice é sum-1
+    last_token_pos = text_inputs["attention_mask"].sum(dim=-1) - 1  # (N,)
+
+    pooled = last_hidden[torch.arange(last_hidden.size(0), device=device), last_token_pos]  # (N, H)
+
+    # Projeção pro espaço multimodal CLIP: (N, D)
+    feats = model.text_projection(pooled)
 
     feats = _maybe_normalize(feats)
 
@@ -118,22 +119,16 @@ async def embeddings_image(file: UploadFile = File(...)):
         raise HTTPException(status_code=400, detail="invalid image file")
 
     inputs = processor(images=image, return_tensors="pt")
-
-    image_inputs = {"pixel_values": inputs["pixel_values"]}
-    image_inputs = _to_device(image_inputs)
+    image_inputs = _to_device({"pixel_values": inputs["pixel_values"]})
 
     if use_amp:
         with torch.cuda.amp.autocast(dtype=torch.float16):
-            out = model(**image_inputs, return_dict=True)
+            vision_outputs = model.vision_model(**image_inputs)  # BaseModelOutputWithPooling
     else:
-        out = model(**image_inputs, return_dict=True)
+        vision_outputs = model.vision_model(**image_inputs)
 
-    feats = getattr(out, "image_embeds", None)
-    if feats is None:
-        raise RuntimeError(
-            "CLIPModel output does not contain image_embeds. "
-            "Check transformers version / model class."
-        )
+    pooled = vision_outputs.pooler_output  # (1, H)
+    feats = model.visual_projection(pooled)  # (1, D)
 
     feats = _maybe_normalize(feats)
 
