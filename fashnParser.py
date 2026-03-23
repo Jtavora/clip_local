@@ -5,6 +5,7 @@
 #
 # Endpoints:
 #   POST /v1/segmentation/human/clothes/cutout.png
+#   POST /v1/segmentation/human/model/cutout-white.png
 #
 # Env vars:
 #   FASHN_MODEL_ID (default: fashn-ai/fashn-human-parser)
@@ -15,6 +16,10 @@
 #   curl -X POST "http://localhost:8000/v1/segmentation/human/clothes/cutout.png" \
 #     -F "file=@./testebody.jpeg" \
 #     --output roupa_recortada.png
+#
+#   curl -X POST "http://localhost:8000/v1/segmentation/human/model/cutout-white.png" \
+#     -F "file=@./testebody.jpeg" \
+#     --output modelo_fundo_branco.png
 
 import io
 import os
@@ -31,6 +36,7 @@ USE_AMP = os.getenv("USE_AMP_FP16", "true").lower() == "true"
 
 # Classes de roupa no esquema de 18 classes do FASHN parser
 CLOTHES_CLASS_IDS = [3, 4, 5, 6, 7, 10]  # top, dress, skirt, pants, belt, scarf
+BACKGROUND_CLASS_ID = 0
 
 BACKGROUND_PRESETS = {
     "transparent": None,
@@ -93,6 +99,10 @@ def _build_clothes_mask(class_mask: torch.Tensor) -> torch.Tensor:
     return binary.to(torch.uint8)
 
 
+def _build_model_mask(class_mask: torch.Tensor) -> torch.Tensor:
+    return (class_mask != BACKGROUND_CLASS_ID).to(torch.uint8)
+
+
 def _resolve_background(background: str) -> tuple[int, int, int] | None:
     value = background.strip().lower()
     if value in BACKGROUND_PRESETS:
@@ -119,7 +129,7 @@ def _png_bytes(img: Image.Image) -> bytes:
 
 def _make_cutout_png_bytes(
     image: Image.Image,
-    clothes_mask: torch.Tensor,
+    cutout_mask: torch.Tensor,
     crop: bool,
     padding: int,
     background: str,
@@ -127,14 +137,14 @@ def _make_cutout_png_bytes(
     if padding < 0:
         raise HTTPException(status_code=400, detail="padding deve ser >= 0")
 
-    alpha = Image.fromarray((clothes_mask * 255).to(torch.uint8).numpy(), mode="L")
+    alpha = Image.fromarray((cutout_mask * 255).to(torch.uint8).numpy(), mode="L")
     rgba = image.convert("RGBA")
     rgba.putalpha(alpha)
 
     if crop:
         bbox = alpha.getbbox()
         if bbox is None:
-            raise HTTPException(status_code=422, detail="nenhuma roupa detectada na imagem")
+            raise HTTPException(status_code=422, detail="nenhuma regiao detectada na imagem")
         left, top, right, bottom = bbox
         if padding > 0:
             left = max(0, left - padding)
@@ -163,7 +173,7 @@ async def segment_clothes_cutout_png(
     clothes_mask = _build_clothes_mask(class_mask)
     png_bytes = _make_cutout_png_bytes(
         image=image,
-        clothes_mask=clothes_mask,
+        cutout_mask=clothes_mask,
         crop=True,
         padding=0,
         background="transparent",
@@ -178,5 +188,35 @@ async def segment_clothes_cutout_png(
             "X-Crop": "true",
             "X-Padding": "0",
             "X-Background": "transparent",
+        },
+    )
+
+
+@app.post("/v1/segmentation/human/model/cutout-white.png")
+async def segment_model_cutout_white_png(
+    file: UploadFile = File(...),
+):
+    contents = await file.read()
+    image = _load_image(contents)
+
+    class_mask = _predict_class_mask(image)
+    model_mask = _build_model_mask(class_mask)
+    png_bytes = _make_cutout_png_bytes(
+        image=image,
+        cutout_mask=model_mask,
+        crop=True,
+        padding=0,
+        background="white",
+    )
+
+    return Response(
+        content=png_bytes,
+        media_type="image/png",
+        headers={
+            "X-Model": MODEL_ID,
+            "X-Endpoint": "model-cutout-white",
+            "X-Crop": "true",
+            "X-Padding": "0",
+            "X-Background": "white",
         },
     )

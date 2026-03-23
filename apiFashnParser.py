@@ -54,6 +54,7 @@ class FashnParserAPI:
 
         # top, dress, skirt, pants, belt, scarf
         self.CLOTHES_CLASS_IDS = [3, 4, 5, 6, 7, 10]
+        self.BACKGROUND_CLASS_ID = 0
 
         self.BACKGROUND_PRESETS = {
             "transparent": None,
@@ -132,6 +133,11 @@ class FashnParserAPI:
             binary |= class_mask == int(class_id)
         return binary.to(torch.uint8)
 
+    def _build_model_mask(self, class_mask):
+        import torch
+
+        return (class_mask != self.BACKGROUND_CLASS_ID).to(torch.uint8)
+
     def _resolve_background(self, background: str):
         from fastapi import HTTPException
 
@@ -159,7 +165,7 @@ class FashnParserAPI:
     def _make_cutout_png_bytes(
         self,
         image,
-        clothes_mask,
+        cutout_mask,
         crop: bool,
         padding: int,
         background: str,
@@ -171,14 +177,14 @@ class FashnParserAPI:
         if padding < 0:
             raise HTTPException(status_code=400, detail="padding deve ser >= 0")
 
-        alpha = Image.fromarray((clothes_mask * 255).to(torch.uint8).numpy(), mode="L")
+        alpha = Image.fromarray((cutout_mask * 255).to(torch.uint8).numpy(), mode="L")
         rgba = image.convert("RGBA")
         rgba.putalpha(alpha)
 
         if crop:
             bbox = alpha.getbbox()
             if bbox is None:
-                raise HTTPException(status_code=422, detail="nenhuma roupa detectada na imagem")
+                raise HTTPException(status_code=422, detail="nenhuma regiao detectada na imagem")
             left, top, right, bottom = bbox
             if padding > 0:
                 left = max(0, left - padding)
@@ -227,7 +233,7 @@ class FashnParserAPI:
             clothes_mask = self._build_clothes_mask(class_mask)
             png_bytes = self._make_cutout_png_bytes(
                 image=image,
-                clothes_mask=clothes_mask,
+                cutout_mask=clothes_mask,
                 crop=True,
                 padding=0,
                 background="transparent",
@@ -242,6 +248,38 @@ class FashnParserAPI:
                     "X-Crop": "true",
                     "X-Padding": "0",
                     "X-Background": "transparent",
+                },
+            )
+
+        @api.post("/v1/segmentation/human/model/cutout-white.png")
+        async def segment_model_cutout_white_png(
+            file: UploadFile = File(...),
+            x_api_key: Optional[str] = Header(default=None),
+        ):
+            self._require_key(x_api_key)
+
+            contents = await file.read()
+            image = self._load_image(contents)
+
+            class_mask = self._predict_class_mask(image)
+            model_mask = self._build_model_mask(class_mask)
+            png_bytes = self._make_cutout_png_bytes(
+                image=image,
+                cutout_mask=model_mask,
+                crop=True,
+                padding=0,
+                background="white",
+            )
+
+            return Response(
+                content=png_bytes,
+                media_type="image/png",
+                headers={
+                    "X-Model": self.MODEL_ID,
+                    "X-Endpoint": "model-cutout-white",
+                    "X-Crop": "true",
+                    "X-Padding": "0",
+                    "X-Background": "white",
                 },
             )
 
