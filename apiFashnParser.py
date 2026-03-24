@@ -283,4 +283,36 @@ class FashnParserAPI:
                 },
             )
 
+        @api.post("/v1/segmentation/human/clothes/cutout-white.png")
+        async def segment_clothes_cutout_white_png(
+            file: UploadFile = File(...),
+            x_api_key: Optional[str] = Header(default=None),
+        ):
+            self._require_key(x_api_key)
+
+            contents = await file.read()
+            image = self._load_image(contents)
+
+            class_mask = self._predict_class_mask(image)
+            clothes_mask = self._build_clothes_mask(class_mask)
+            png_bytes = self._make_cutout_png_bytes(
+                image=image,
+                cutout_mask=clothes_mask,
+                crop=True,
+                padding=0,
+                background="white",
+            )
+
+            return Response(
+                content=png_bytes,
+                media_type="image/png",
+                headers={
+                    "X-Model": self.MODEL_ID,
+                    "X-Endpoint": "clothes-cutout-white",
+                    "X-Crop": "true",
+                    "X-Padding": "0",
+                    "X-Background": "white",
+                },
+            )
+
         return api
